@@ -1,0 +1,1 @@
+####script will work on premade script to output rainfall analysis
