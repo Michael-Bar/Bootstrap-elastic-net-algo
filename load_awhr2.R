@@ -1,5 +1,10 @@
 ##combine metadata with awhere data
-suppressMessages(library(maptools))
+
+## Fresh package install
+#devtools::install_github("aWhereAPI/aWhere-R-Library", force = T)
+
+
+library(maptools)
 library(ggplot2)
 library(rgdal)
 library(maptools)
@@ -8,10 +13,36 @@ library(leaflet)
 library(sp)
 library(XML)
 library(readr)
-suppressMessages(library(aWhereAPI))
+library(aWhereAPI)
 library(lubridate)
-suppressMessages(library(data.table))
-suppressMessages(library(curl))
+library(data.table)
+library(curl)
+
+
+#func
+getNormWeather <- function(dat, row){
+  t <- try(get_fields(dat[row, "nom"]))
+  if(inherits(t, "try-error")) {
+    create_field(dat[row,"nom"], dat[row,"Latitude"], dat[row,"Longitude"], dat[row, "nom"])
+  }
+  val = agronomic_norms_fields(dat[row, "nom"], norm_start, norm_end, norm_start_year, norm_end_year)
+  return(val)
+}
+
+
+
+
+
+getdayWeather <- function(dat2, row){
+  t <- try(get_fields(dat2[row, "nom"]))
+  if(inherits(t, "try-error")) {
+    create_field(dat2[row,"nom"], dat2[row,"Latitude"], dat2[row,"Longitude"], dat2[row, "nom"])
+  }
+  val = odaily_observed_fields(field_id = dat2[row,"nom"], startdate, stopdate)
+  return(val)
+}
+
+######
 
 #load in locally modified functions to avoid certain issues with daily data
 #D:/OneAcre/Google Drive/One Acre Fund/optimized_agronomy/weather
@@ -39,7 +70,7 @@ source("D:/OneAcre/Google Drive/One Acre Fund/optimized_agronomy/weather/daily_o
 #write.csv(x, file="D:/OneAcre/Google Drive/One Acre Fund/optimized_agronomy/weather/test.csv")
 start.time <- proc.time()
 
-dat <- read_csv("2016_site_Client_plant_gps_full.csv")
+dat <- read_csv("C:/Users/Michael/OneDrive/OAF/MB/Projects/Roster_data/Kenya/2016_site_Client_plant_gps_full.csv")
 colnames(dat)
 
 # First check GPS points are sensible -------------------------------------
@@ -112,47 +143,9 @@ stopdate <- "2016-12-31"
 
 
 
-#tesdat<- subdat[1,]
-#tesdat$Longitude
-#tesdat$Latitude
-#test <- agronomic_norms_fields(subdat[1, "nom"], norm_start, norm_end, norm_start_year, norm_end_year)
 
-#summary(test)
-#colnames(test)
-
-#ggplot(test) + geom_point(aes(x=day, y=pet.average)) + geom_ribbon(aes(x=day, ymin=pet.average-pet.stdDev, ymax=pet.average + pet.stdDev), colour = "blue", alpha=1.0)
-
-
-#now for the real thing
-#def function to return mega DF of weather data
-getNormWeather <- function(dat, row){
-  t <- try(get_fields(dat[row, "nom"]))
-  if(inherits(t, "try-error")) {
-    create_field(dat[row,"nom"], dat[row,"Latitude"], dat[row,"Longitude"], dat[row, "nom"])
-  }
-  val = agronomic_norms_fields(dat[row, "nom"], norm_start, norm_end, norm_start_year, norm_end_year)
-  return(val)
-}
-
-
-
-
-
-getdayWeather <- function(dat2, row){
-  t <- try(get_fields(dat2[row, "nom"]))
-  if(inherits(t, "try-error")) {
-    create_field(dat2[row,"nom"], dat2[row,"Latitude"], dat2[row,"Longitude"], dat2[row, "nom"])
-  }
-  val = odaily_observed_fields(field_id = dat2[row,"nom"], startdate, stopdate)
-  return(val)
-}
-
-
-#can troubleshoot and test here
-#subda <- dat[1:10,]
-#use full data
 subda <- dat
-dim(subda)
+
 
 
 
@@ -165,25 +158,28 @@ dim(subda)
 
 #daily_observed_fields(, day_start, day_end)
 
-# start.time <- proc.time()
-# dim(subda)
-# res <- NULL
-# for(i in 1:dim(subda)[1]){
-#   pt <-proc.time()
-#   print(i/dim(subda)[1]*100)
-#   
-#   out <- getNormWeather(subda, i)
-#   out
-#   res <- rbind(res, out) 
-#   print(dim(res))
-#   print(proc.time()-pt)
-# }
-# 
-# dim(res)
-# 
-# dim(subda)
-# colnames(res)
+start.time <- proc.time()
+dim(subda)
+res <- NULL
+ix <- 1
+for(i in ix:dim(subda)[1]){
+  ix <- i
+  pt <-proc.time()
+  print(i/dim(subda)[1]*100)
 
+  out <- getNormWeather(subda, i)
+  res <- rbind(res, out)
+  print(dim(res))
+  print(proc.time()-pt)
+}
+
+dim(res)
+
+dim(subda)
+colnames(res)
+
+
+#write.csv(res, file="full_awhere_05-15.csv", row.names = FALSE)
 
 ##test out other functions
 startdate <- "2016-01-01"
@@ -212,17 +208,42 @@ for(i in ix:dim(subda)[1]){
   re <- rbind(re, ou) 
   print(paste("DIMS",dim(re)))
   print(proc.time()-pt)
-  
-}
+  }
 
 
 dim(re)
 dim(subda)
 
 
-write.csv(re, file="full_awhere_16.csv", row.names = FALSE)
+#write.csv(re, file="full_awhere_16.csv", row.names = FALSE)
 
 proc.time() - start.time
+
+
+awhr <- res
+awhr16 <- re
+
+sitedat <- dat
+
+
+awhr$semi.name <- "A"
+awhr16$semi.name <- "B"
+
+x <- seq(1:dim(sitedat)[1])
+x<- (x*366)-365
+for(i in 1:length(x)   ){
+  
+  loc <- x[i]
+  loc2 <- loc+366
+  nam <- sitedat$semi.name[i]
+  awhr[loc:loc2,]$semi.name <- nam
+  awhr16[loc:loc2,]$semi.name <- nam }
+
+write.csv(awhr, "C:/Users/Michael/OneDrive/OAF/MB/Projects/Roster_data/Kenya/aWhere/full_awhere_05-15.csv")
+write.csv(awhr16,"C:/Users/Michael/OneDrive/OAF/MB/Projects/Roster_data/Kenya/aWhere/full_awhere_16.csv")
+
+
+
 
 stop()
 

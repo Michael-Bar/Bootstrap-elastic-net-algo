@@ -172,20 +172,20 @@ supdat$Border <- as.numeric(supdat$Border)
 
 
 supsite <- supdat %>% group_by(semi.name) %>% summarise_each(funs(mean))
-unique(supsite$semi.name)
+
 supsite$nom <- rownames(supsite)
 
-#lets subset only the numeric cols. As all others are NAN due to piping above
-nums <- sapply(supsite, is.numeric)
-supsite <- supsite[ , nums]
-lapply(supsite, summary)
-colnames(supsite)
+
+#lets subset only non NAs
+supsite <- Filter(function(x)!all(is.na(x)), supsite)
+
+supsite$semi.name
 
 supsite$pc.new <- supsite$new.clients/(supsite$new.clients + supsite$ret.clients) *100.
 supsite$qualify.pc <- (supsite$total.qualified.clients/supsite$total.enrolled.clients)*100.
 supsite$tot.client <- supsite$new.clients + supsite$ret.clients
-supsite$nom <- row.names(supsite)
+
 
 #output condensed - site only form of DF
-#write.csv(supsite, file="2016_site_Client_plant_gps_full.csv", row.names = FALSE)
+write.csv(supsite, file="2016_site_Client_plant_gps_full.csv", row.names = FALSE)
 
