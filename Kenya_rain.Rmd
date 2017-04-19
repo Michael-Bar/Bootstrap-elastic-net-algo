@@ -1,0 +1,1495 @@
+---
+title: "Kenya drought analysis 2016"
+author: '[Michael Barber](mailto:mike.barber@oneacrefund.org)'
+date: '`r format(Sys.time(), "%d %B, %Y")`'
+output:
+  html_document:
+    code_folding: hide
+    number_sections: yes
+    theme: flatly
+    toc: yes
+    toc_depth: 6
+    toc_float: yes
+  pdf_document:
+    toc: yes
+    toc_depth: '6'
+subtitle: No significant correlation between 2016 Kenya drought and repayment/enrollment
+---
+
+```{r setup, include=FALSE}
+#### set up
+## clear environment and console
+rm(list = ls())
+cat("\014")
+
+
+
+
+library(dplyr)
+library(randomForest)
+library(lattice)
+library(parallel)
+library(aod)
+library(zoo)
+library(ggfortify)
+library(ggplot2)
+library(doParallel)
+library(ROCR)
+library(cowplot)
+library(corrplot)
+library(knitr)
+
+library(plotmo)
+
+library(broom)
+library(robustbase)
+library(Rcpp)
+library(pscl)
+library(caTools)
+library(boot)
+library(mice)
+library(VIM)
+library(plyr)
+library(reshape)
+library(forcats)
+library(plotly)
+library(car)
+library(readr)
+library(stargazer)
+
+library(MKmisc)
+library(ResourceSelection)
+
+
+library(glmnet)
+
+
+
+#####functions -----------
+
+
+
+
+# Functions ---------------------------------------------------------------
+
+
+
+boot_net <- function(drop_names,yvar, df,type,obj1) {
+#wrap a bootstrap around an elastic net (with simple optimiser)
+#will return 2 things. A table of coeffs with bootstrap SEMs, and a list of AUC scores
+
+    aucy <- c()
+    xa <- tidy(coef(obj1, s = "lambda.1se"))
+    i<- 1
+    for(i in seq(1:10)){
+      sample = sample.split(df, SplitRatio = 0.75) #sample contains only boolean indecies
+      trx = subset(df, sample == TRUE)
+      trx_y <- trx[yvar]
+      hox <- subset(df, sample == TRUE)
+      hox_y <- hox[yvar]
+      
+      trx_y <- as.matrix(trx_y)
+      hox_y <- as.matrix(hox_y)
+
+      
+      
+      
+      x<- drop_names
+      trx[x] <- NULL
+      hox[x] <- NULL
+
+      
+      if(type=="regression"){
+      
+      als <- c(0.0,0.1,0.25,0.5,0.75,0.9,1.0)
+      xc <- get_alpha(trx,trx_y, als, type="regressor")
+      got_al <- xc$Alphas[which(xc$AUC == min(xc$AUC))] # min MSE
+    
+      cvboot <- cv.glmnet(x = scale(data.matrix(trx)), y = trx_y, family = 'gaussian', alpha=got_al,  type.measure = 'mse',intercept=TRUE)
+      
+            
+      prob <- predict(cvboot,type="response", newx = scale(data.matrix(hox)), s = 'lambda.1se')
+      
+      rs <- summary(lm(prob ~ hox_y))$r.squared
+      
+      aucy <- c(aucy, rs)
+      
+      }
+      if(type=="classification"){
+        als <- c(0.0,0.1,0.25,0.5,0.75,0.9,1.0)
+        xc <- get_alpha(trx,trx_y, als, type="Classifier")
+        got_al <- xc$Alphas[which(xc$AUC == max(xc$AUC))] # max AUC
+    
+              cvboot <- cv.glmnet(x = scale(data.matrix(trx)), y = trx_y, family = 'binomial', alpha=got_al,  type.measure = 'auc',intercept=TRUE)
+      
+      auc_score <- max(cvboot$cvm) #vaguely a CV score
+
+      
+      aucy <- c(aucy, auc_score)
+      
+      }
+      
+      xb <- tidy(coef(cvboot, s = "lambda.1se"))
+   
+
+      
+      xa <- merge(xa,xb, by="row")
+      
+    }
+  
+   
+    colnames(xa) <- seq(1:dim(xa)[2])
+    lc <- NULL
+    l <- NULL
+    for(i in seq(1:dim(xa)[1])){
+      
+    l <- data.frame("feature"= xa[,1][i], "Coeff"=rowMeans(xa[i,][c(3,5,7,9,11,13,15,17,19,21,23)]), "sem"=sems(unlist(xa[i,][c(3,5,7,9,11,13,15,17,19,21,23)])  )    )
+    lc <- rbind(lc,l)
+    
+    }
+    
+    
+       ###end boot
+    
+    lc <- subset(lc, Coeff**2 > (1.95*sem)**2) # only return Coeffs that pass a SEM threshhold
+    rety <- list("coeffs" = lc, "score" = aucy)
+    return(rety)
+    
+}   
+    
+
+
+get_timed_coeff <- function(plantdate,weather, weathernew, otherdf, times, targetname, datf, al , type){
+#get_timed_coeff is a monster function, essentially it recombines the data to include a subset of weather data for a given timeframe (from times var). It also caluclates deviations from historical norms (if type=="diff"), tunes the elastic net algo, calculcates coefficients and AUC scores (bootstrap) and repeats for every time block in the "times" list made above
+#You'll note a lot of it is hard coded. Begging the question "why functionalise?". The reason being to allow various values for planting dates and timeframes to be plugged in dynamically
+   
+  growdat <- subset(weather, day >= plantdate)
+  growdat16 <- subset(weathernew, date >= plantdate)
+  grw16 <- subset(otherdf, date >= plantdate)
+  colnames(growdat16) <- paste(colnames(growdat16), "ag2016", sep="_")
+  colnames(growdat16)[1] <- "semi.name"
+  
+  colnames(grw16) <- paste(colnames(grw16), "2016", sep="_")
+  colnames(grw16)[1] <- "semi.name"
+  
+  
+  ada <- length(times)-1
+
+  #pb <- txtProgressBar(min = 0, max = ada, style = 3)
+  pd_cv <- c()
+  pd_sd <- c()
+  predy <- c()
+  
+i <- 1
+  for(i in seq(1:ada)){
+    #setTxtProgressBar(pb, i)
+    #print(times[i])
+    g <- subset(growdat, day >= times[i] & day <= times[i+1])
+    g16 <- subset(growdat16, date_ag2016 >= times[i] &  date_ag2016 <= times[i+1])
+    d16 <-  subset(grw16, date_2016 >= times[i] &  date_2016 <= times[i+1])
+    g16$semi.name <- g16$semi.name_ag2016
+    d16$semi.name <- d16$semi.name_2016
+    
+    
+    g <- g %>% group_by(semi.name) %>% summarise_each(funs(mean))
+    g16 <- g16 %>% group_by(semi.name) %>% summarise_each(funs(mean))
+    d16 <- d16 %>% group_by(semi.name) %>% summarise_each(funs(mean))
+
+
+    
+    
+    avdat <- merge(datf, g, by="semi.name")
+    avdat <- merge(avdat, g16, by="semi.name")
+    avdat <- merge(avdat, d16, by="semi.name")
+    sdat <- Filter(function(x)!all(is.na(x)), avdat)
+    sdat$OAFID <- NULL
+    sdat$SeasonID <- NULL
+    sdat$RegionID <- NULL
+    sdat$DistrictID <- NULL
+    sdat$SectorID<- NULL
+    sdat$SiteID<- NULL
+    sdat$GroupID <- NULL
+    sdat$nom <- NULL
+    
+    #left in just in case:
+    sdat$TotalRepaid <- NULL
+    sdat$TotalRepaid_IncludingOverpayments <- NULL
+    sdat$RemainingCredit <- NULL
+    sdat$pc.new <- NULL
+    sdat$first.maize.plant <- NULL
+    sdat$last.maize.plant <- NULL
+    sdat$day <- NULL
+    sdat$date_2016 <- NULL
+    sdat$Date <- NULL
+    sdat$date_ag2016 <- NULL
+    
+    sdat$default <- as.factor(sdat$default)
+    
+
+    #add in diff calcs
+    if(type=="diff"){
+      #print("Difference calculations...")
+      sdat$diff.pet <- sdat$precipitation.amount_2016  - sdat$pet.average 
+      sdat$pet.amount_2016 <- NULL
+      sdat$pet.average <- NULL
+      
+      sdat$ppet_diff <- sdat$ppet_ag2016 - sdat$ppet.average
+      sdat$ppet_ag2016 <- NULL
+      sdat$ppet.average <- NULL
+      
+      sdat$gdd_diff <- sdat$gdd_ag2016 - sdat$gdd.average
+      sdat$gdd.average <- NULL
+      sdat$gdd_ag2016 <- NULL
+      
+      sdat$acc_gdd_diff <- sdat$accumulatedGdd_ag2016 - sdat$accumulatedGdd.average
+      sdat$accumulatedGdd_ag2016 <- NULL
+      sdat$accumulatedGdd.average <- NULL
+      
+      sdat$acc_ppet_diff <- sdat$accumulatedPpet_ag2016 - sdat$accumulatedPpet.average
+      sdat$accumulatedPpet.average <- NULL
+      sdat$accumulatedPpet_ag2016 <- NULL
+      
+      sdat$acc_pet_diff <- sdat$accumulatedPet.amount_ag2016 - sdat$accumulatedPet.average
+      sdat$accumulatedPet.amount_ag2016 <- NULL
+      sdat$accumulatedPet.average <- NULL
+    }
+    
+    ####
+    
+    
+    #matrices for LASSO
+    sdat$X1 <- NULL
+    sdat$X1_1 <- NULL
+
+    lassodat <- sdat
+    
+    
+    x <- grep("Date", lapply(lassodat,class) )
+    lassodat[x] <- as.numeric(unlist(lassodat[x]))
+    colnames(lassodat)
+    lassodat$X..Repaid <- NULL
+    lassodat$location.longitude_2016 <- NULL
+    lassodat$location.latitude_2016 <- NULL
+    lassodat$rep.rate <- NULL
+    lassodat$NewMember <- NULL
+    lassodat$semi.name_2016 <- NULL
+    lassodat$pet.units <- NULL
+    lassodat$accumulatedPet.units <- NULL
+    lassodat$accumulatedPrecipitation.units <- NULL
+    lassodat$semi.name_ag2016 <- NULL
+    lassodat$field_id_ag2016 <- NULL
+    lassodat$location.fieldId_2016 <- NULL
+    lassodat$meantemp <- (lassodat$temperatures.max_2016 + lassodat$temperatures.max_2016)/2
+    lassodat$temperatures.max_2016 <- NULL
+    lassodat$temperatures.min_2016 <- NULL
+    lassodat$wind.average_2016 <- NULL
+    lassodat$wind.dayMax_2016 <- NULL
+    lassodat$wind.morningMax_2016 <- NULL
+    lassodat$pet.amount_ag2016 <- NULL
+    lassodat$accumulatedPrecipitation.amount_ag2016 <- NULL
+    lassodat$precipitation.amount_2016 <- NULL
+    lassodat$solar.amount_2016 <- NULL
+    lassodat$relativeHumidity.max_2016 <- NULL
+    lassodat$relativeHumidity.min_2016 <- NULL
+    #colnames(lassodat)
+    #remove anything not 2016
+    lassodat[3:10] <- NULL
+    lassodat$acc_gdd_diff <- NULL
+    lassodat$acc_pet_diff <- NULL
+    lassodat$acc_ppet_diff <- NULL
+
+    sample = sample.split(lassodat, SplitRatio = 0.75) #sample contains only boolean indecies
+    tr = subset(lassodat, sample == TRUE)
+    ho = subset(lassodat, sample == FALSE)
+    tr_y <- tr$default
+    ho_y <- ho$default
+    dim(lassodat)
+    
+    x<- c("semi.name","default")
+    tr[x] <- NULL
+    ho[x] <- NULL
+    
+    #corrplot(cor(tr) ,tl.cex=0.5, tl.col='blue', tl.pos='lower'  ) 
+    
+    #lastly - convert to matrix
+    tr <- as.matrix(tr)
+    tr_y <- as.matrix(tr_y)
+    ho <- as.matrix(ho)
+    ho_y <- as.matrix(ho_y)
+    
+    #lasso reg to handle autocorr (see below for autocorr results)
+    #get alpha
+    #print("get alpha")
+    if(class(al)!="numeric"){    
+    als <- c(0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0)
+    xc <- get_alpha(tr,tr_y, als, type="Classifier")
+    got_al <- xc$Alphas[which(xc$AUC == max(xc$AUC))]
+    }
+      
+      
+
+
+    #print(paste("ALPHA",got_al))
+    
+    
+    #print("running EN...")
+    cvrep <- cv.glmnet(x = scale(data.matrix(tr)), y = tr_y, family = 'binomial', alpha=got_al,  type.measure = 'auc',nlambda=50,intercept=TRUE)
+    #plot(cvrep)
+    aucy <- max(cvrep$cvm)
+   
+    prob <- predict(cvrep,type="response", newx = scale(data.matrix(ho)), s = 'lambda.1se')
+    lassopred <- round(prob)
+    lasso_cv_pred <- as.numeric(lassopred) + as.numeric(ho_y)
+    
+    correct_lasso <- (sum(lasso_cv_pred ==0) + sum(lasso_cv_pred ==2)) /  length(lasso_cv_pred ) *100
+    ##auc_s <- (sum(lasso_cv_pred ==1) / length(lasso_cv_pred)) / (sum(lasso_cv_pred ==2) / length(lasso_cv_pred))
+    #print(paste("Total correct Lasso prediction % ==", round(correct_lasso,2 ),"for dates",times[i],"to",times[i+1]   ))
+
+    
+    #get bootstrap errors
+    dr <- c("semi.name","default") # variables to drop
+    lst <- boot_net(dr,"default",lassodat,type="classification",cvrep) # vars to drop, response var, df, type, and   original elastic net
+    
+    
+    lc <- lst$coeffs # coeffs with SEMs from bootstrap
+    aucy <- mean(lst$score) #mean AUC score from bootstrap
+    aucy_sd <- sd(lst$score)
+    
+    xd <- ggplot(data=lc, aes(reorder(feature, -Coeff), y=Coeff)) + geom_bar(stat = "identity") + theme(text = element_text(size=20),axis.text.x = element_text(angle=90, hjust=1)) + ylab("scaled coeff") + geom_errorbar(aes(reorder(feature, -Coeff), y=Coeff, ymin=Coeff-sem,ymax=Coeff+sem),width=0.25) + xlab("Feature")
+    
+    
+
+    lc$date <- times[i]
+    lc$date_end <- times[i+1]
+    lc$alpha <- got_al
+    lc$auc <- aucy
+    
+    
+    pd_cv <- c(pd_cv, aucy)
+    pd_sd <- c(pd_sd, aucy_sd)
+    predy <- c(predy,correct_lasso)
+    
+    #turn this off for the real run
+    if(1==0){
+      dir.create("./regressions/", showWarnings = FALSE)
+      out <- paste("regressions/",times[i],"-net.csv",sep="")
+      
+      
+      suppressMessages(ggsave(paste(times[i],"-net.png",sep=""), ggplot())) # stop the messages about saving
+      ggsave(filename=paste(times[i],"-net.png",sep=""), plot=xd, device="png", path="./regressions/" )
+      write.csv(lc, out, row.names = FALSE) 
+      
+    }
+    
+    
+
+    
+  } 
+  
+  timeddf <- data.frame("AUC"=pd_cv,"SD"=pd_sd)
+  timeddf$pred <- predy
+  return(timeddf)
+}
+
+
+
+get_alpha <- function(inp1, y1, alphas, type){
+  #optimise alpha in elastic net for best AUC or R2
+  ret <- c()
+  la <- c()
+  
+  if(type=="Classifier"){
+    for(ic in alphas){
+          
+  
+  cval <- cv.glmnet(x = scale(data.matrix(inp1)), y = y1, family = 'binomial', alpha=ic,  type.measure = 'auc',intercept=TRUE)
+  
+  ret <- c(ret, max(cval$cvm))
+  la <- c(la, cval$lambda.1se)
+    }
+  }
+  if(type != "Classifier"){
+    for(ic in alphas){
+    
+    cval <- cv.glmnet(x = scale(data.matrix(inp1)), y = y1, family = 'gaussian', alpha=ic, type.measure="mse", intercept=TRUE)
+  
+  ret <- c(ret, min(cval$cvm))
+  la <- c(la, cval$lambda.1se)
+    
+  }}
+  df_ret <- data.frame("Alphas"=alphas, "AUC"=ret, "Lambda1se"=la)
+  return(df_ret)
+  
+  
+}
+  
+  
+  
+multiplot <- function(..., plotlist=NULL, file, cols=1, layout=NULL) {
+  #plot and format multiple graphs
+  library(grid)
+  
+  # Make a list from the ... arguments and plotlist
+  plots <- c(list(...), plotlist)
+  
+  numPlots = length(plots)
+  
+  # If layout is NULL, then use 'cols' to determine layout
+  if (is.null(layout)) {
+    # Make the panel
+    # ncol: Number of columns of plots
+    # nrow: Number of rows needed, calculated from # of cols
+    layout <- matrix(seq(1, cols * ceiling(numPlots/cols)),
+                     ncol = cols, nrow = ceiling(numPlots/cols))
+  }
+  
+  if (numPlots==1) {
+    print(plots[[1]])
+    
+  } else {
+    # Set up the page
+    grid.newpage()
+    pushViewport(viewport(layout = grid.layout(nrow(layout), ncol(layout))))
+    
+    # Make each plot, in the correct location
+    for (i in 1:numPlots) {
+      # Get the i,j matrix positions of the regions that contain this subplot
+      matchidx <- as.data.frame(which(layout == i, arr.ind = TRUE))
+      
+      print(plots[[i]], vp = viewport(layout.pos.row = matchidx$row,
+                                      layout.pos.col = matchidx$col))
+    }
+  }
+}
+
+reg_line <-function(models, m,x,inter){ #model name, slope, x list, intercept
+  lobf <- c()
+  xshort <-  x[seq(1, length(x), 6)]
+  for(i in xshort){
+    y= i * coef(models)[m] + coef(models)[inter]
+    lobf <- c(lobf, y)
+  }
+  ls <- list("lobf"=lobf, "newx"=xshort)
+  return(ls)
+}
+
+
+###slim down data
+
+slim_my_data <- function(data_to_slim, fac, slimname){
+  #this function will read in data and then spit out a small subsample of that data
+  #the purpose is to allow working with smaller data representing the original data (i.e. calc times)
+  set.seed(101) #reproducible 
+  sample = sample.split(data_to_slim, SplitRatio = fac) #sample contains only boolean indecies
+  data.train = subset(data_to_slim, sample == TRUE)
+  data.test = subset(data_to_slim, sample == FALSE)
+  write.csv(data.train, file= slimname) }
+
+
+excluded <- function(l1,l2){
+  #find elements not in both lists
+  exc <- c()
+  exc <- setdiff(l1,l2)
+  exc <- c(exc, setdiff(l2,l1))
+  exc <- unique(exc)
+  return(exc)
+}
+
+
+number_ticks <- function(n) {function(limits) pretty(limits, n)} # graph formating
+
+sems <- function(x) sqrt(var(x)/length(x)) # calc standard error of the mean
+
+cohen_d <- function(m1,m2,s1,s2) {  
+  #calc Cohen's effect size
+  spo <- sqrt((s1**2 + s2**2)/2)
+  d <- (m1 - m2)/spo
+  effsi <- d / sqrt((d**2)+4)
+  ret <- list("d" = d, "effectsi" = effsi)
+  return(ret)
+  
+}
+
+#### Begin script ------------
+
+
+#data at the site level, merged from SC,VR and M&E
+sitedat <- read_csv("C:/Users/Michael/OneDrive/OAF/MB/Projects/Roster_data/Kenya/2016_site_Client_plant_gps_full_2.csv")
+sitedat <- sitedat[complete.cases(sitedat$Latitude),]
+
+#weather data downloaded from aWhere via the API
+#histo data
+awhr <- read_csv("C:/Users/Michael/OneDrive/OAF/MB/Projects/Roster_data/Kenya/aWhere/full_awhere_05-15.csv")
+#2016 weather
+awhr16 <- read_csv("C:/Users/Michael/OneDrive/OAF/MB/Projects/Roster_data/Kenya/aWhere/full_awhere_16.csv")
+#2016 ag norms
+ag16 <- read_csv("C:/Users/Michael/OneDrive/OAF/MB/Projects/Roster_data/Kenya/aWhere/full_awhere_ag_16_2.csv")
+
+
+
+
+```
+
+# Summary
+## Overview
+
+Kenya experienced erratic rainfall during 2016, with many farmers reporting drought conditions. The aim of this report is to assess the impact of 2016 weather patterns on farmer repayment (2016) and enrollment (2017) for our farmers in western Kenya.
+
+Our metric for repayment will be a flag for default, whilst we will look at enrollment through two metrics; 1) change in site size 2015-2016, and 2) the percentage of farmers dropped from each site. I have here used a technique to reduce the number of important features whilst maintaining accuracy (see methods for more details). You can see a glossary explaining the weather acronyms and analysis concepts  [here](#glossary)
+
+# Main hypotheses
+
+> H1 Erratic weather patterns (and specifically rainfall) in 2016 impacted farmer repayment in 2016
+ 
+> H2 Erratic weather patterns (and specifically rainfall) in 2016 impacted farmer enrollment in 2017
+
+> H3	The impact of erratic weather is time-dependent, with regards to maize growth (secondary hypothesis)
+
+# Main takeaways
+
+> aWhere data did not explain 2016 repayment or 2017 enrollment trends.
+
+### Summary of results:
+
+* *H1) did weather affect repayment in 2016?* - 2016 weather did effect repayment default frequency. However, the effect seems to be primarily driven by long-standing differences in climates rather than 2016 specific climate events. I.e. farmers in areas with poor weather conditions repaid less in 2016, however, these farmers often experience poor weather.
+
+* This suggests that **2016 weather in itself had no impact on farmer repayment**. Instead, we can say that areas with historically good weather often outperform those with historically bad weather, and this same trend manifested in 2016. 
+
+* *H2) did 2016 weather affect 2017 enrollment?* - little relationship was observed between climate and enrollment, regardless of the metrics used (either site growth or dropped clients)
+
+* *H3) did weather have time dependent effects?* - whilst there is some evidence for decreasing importance of weather with increasing time after maize planting, it is minimal. This is unsurprising given the ability of historical weather to explain variation in repayment.
+
+* Adding weather data on top of Roster data yields little increase in predictive accuracy. Suggesting that Roster is picking up behavioral changes influenced by the climate. This also suggests a Roster-only predictive model would be as useful as a weather based model. 
+
+
+### Data quality disclaimer:
+
+* All weather variables are highly correlated - this has two repercussions: 1) an equally accurate model is likely achievable using different weather features (e.g. using PPET, PET or precipitation will likely give a similar score) 2) coefficients are likely to be relatively unstable. 
+
+* I have attempted to deal with these issues with an elastic net in a bootstrap wrapper (see [methodology](#methodology)).
+
+* The weather data is sourced from aWhere, which has "virtual weather stations" across the globe, we are yet to independently validate their weather data. 
+
+> In summary, for weather variables; I would pay more attention to the overall predictive AUC or R-squared score and less to the exact coefficient value. For non-weather variables this is not an issue (I have included a sample correlation plot in the appendix to demonstrate these points).
+
+### Recommendations
+
+Possible recommendations include focusing analysis on district level effects (rather than country level) as these seem to contain the most variability. A more radical recommendation is to consult weather-based data in decisions when expanding existing sites or founding new sites. 
+
+# Analysis 
+
+## Kenya wide trends
+
+Let's first look at average weather patterns for all our GPS tagged sites:
+
+```{r, av_weather, warning=FALSE}
+
+#Lets plot site wide averages for Kenya
+
+#prepare data
+histo_pet <-  ddply(awhr, c("day"), summarise,  avpet= mean(pet.average), avsd = mean(pet.stdDev)   )
+sixt_pet <-  ddply(awhr16, c("date"), summarise,  pet= mean(precipitation.amount), sdpet = sd(precipitation.amount)   )
+sixt_pet <- subset(sixt_pet, date != "2016-02-29") # leave out leap year data
+histo_pet$day <- as.Date(histo_pet$day, format = "%m-%d")
+histo_pet <- histo_pet[complete.cases(histo_pet),]
+histo_pet$pet16 <- sixt_pet$pet
+histo_pet$petsd16 <- sixt_pet$sdpet
+
+#make moving average to smooth out 2016 data
+histo_pet$pet16mov <- rollmean(histo_pet$pet16,14, na.pad=TRUE)
+
+#plot
+p1 <- ggplot(histo_pet) + geom_point(aes(x=day, y=avpet, colour="Historical")    ) + geom_ribbon(aes(x=day, ymax=avpet+avsd,ymin=avpet-avsd),alpha=0.1) + geom_point(aes(x=day,y=pet16, colour="2016"))  +  scale_x_date(date_breaks = "3 month", limits = as.Date(c('2017-01-01','2017-12-30')))
+p1 <- p1 + geom_line(data=histo_pet, aes(x=day, y=pet16mov, colour="moving av"),size=1.5 , color="red")   + ylab("Average PET (mm)")  + xlab("Date")                       
+
+p3 <- ggplot(sitedat) + geom_freqpoly(binwidth=8,aes(x=first.maize.plant+365,colour="First planting"),size=2) 
+
+p3 <- p3  + geom_freqpoly(binwidth=8,aes(x=last.maize.plant+365,colour='Last planting'),size=2) + xlab("Date") + scale_x_date(date_breaks = "3 month", 
+                                                                                                                              limits = as.Date(c('2017-01-01','2017-12-30'))) 
+#all kenya
+
+multiplot(p1,p3 ,cols=1)
+
+```
+
+In the above figure, the top panel presents farmer-wide averages for historic (blue, grey shading represents standard deviations) and 2016 (red points and line, the latter is the 2 week moving average) data. We can see that farmers are planting maize immediately after the first rains. Interestingly, before planting there is a prolonged period of below-average rainfall, but this is less apparent after planting. The above pair of graphs are an average across all One Acre Fund farmers in Kenya, so are likely to hide a lot of details. 
+
+Directly plotting 2016 moving average precipitation against historical averages highlights the differences. Note that in the graph below, each point represents a 2016 pet value (X, actually a moving average to smooth out fluctuations) and a historic pet value (Y) for a given date, a perfect correlation would look like a straight, diagonal line. 
+
+```{r, lm_rain , warning=FALSE}
+
+#XY plot of historical vs 2016
+#ideally we would also plot 2015 vs historical to look at how wild it is too
+ggplot(histo_pet) + geom_point(aes(x=pet16mov, y=avpet)) + geom_smooth(aes(x=pet16mov, y=avpet), method='lm') + ylab("Average historic PET (mm)") + xlab("2016 smoothed PET (mm)")
+
+#get diagnostics
+#x <- lm(avpet ~ pet16mov, data=histo_pet)
+#plot(x)
+
+```
+
+
+# Weather vs. repayment (H1) <a id="rep1"></a>
+We can extend the above by running regressions on farmer repayment (here set as a default or non-default flag) vs. weather data for a period starting on the mean maize planting date and ending 120 days after mean planting date.  
+
+For our first analysis, let us look at how effective simple agronomic norms are at predicting farmer repayment. To do this we will first train our elastic net regression (see methods) and then test it on some 'holdout' data, which the model has never seen (in effect, this holdout data is just a randomly selected sample of the original data). For this model we are specifically looking at 2016 deviations in weather from historical (2005-2015) norms. 
+
+```{r, last-data-merge , results="hide", warning=FALSE}
+
+
+####
+#lets make up sums for the growing season
+#get mean planting date
+awhr$day <- as.Date(awhr$day, format = "%m-%d") - 365 # fake like its 2016 to make plotting easier
+mu_plant <-  mean(sitedat$first.maize.plant) 
+
+#subset awhere to mean first plant + 4 months(to capture maize growing period)
+growdat <- subset(awhr, day >= mu_plant & day <= mu_plant+120)
+growdat16 <- subset(awhr16, date >= mu_plant & date <= mu_plant+120)
+ag16sub <- subset(ag16, date >= mu_plant & date <= mu_plant+120)
+
+#group
+avwhr <- growdat %>% group_by(semi.name) %>% summarise_each(funs(mean))
+avwhr16 <- growdat16 %>% group_by(semi.name) %>% summarise_each(funs(mean))
+agwhr <- ag16sub %>% group_by(semi.name) %>% summarise_each(funs(mean))
+
+#remove NA columns
+avwhr <- Filter(function(x)!all(is.na(x)), avwhr)
+avwhr16 <- Filter(function(x)!all(is.na(x)), avwhr16)
+agwhr <- Filter(function(x)!all(is.na(x)), agwhr)
+
+#remove or rename cols
+avwhr16$X1 <- NULL
+avwhr16$X1_1 <- NULL
+avwhr$X1 <- NULL
+avwhr$X1_1 <- NULL
+colnames(avwhr16) <- paste(colnames(avwhr16), "2016", sep="_")
+colnames(avwhr16)[1] <- "semi.name"
+colnames(agwhr) <- paste(colnames(agwhr),"ag2016",sep="_")
+colnames(agwhr)[1] <- "semi.name"
+agwhr$X1_ag2016 <- NULL
+
+
+#combine into super dataframe
+avdat <- merge(sitedat, avwhr, by="semi.name")
+avdat <- merge(avdat, avwhr16, by="semi.name")
+avdat <- merge(avdat, agwhr, by="semi.name")
+
+#again, remove useless cols
+avdat$day <- NULL
+avdat$date_2016 <- NULL
+avdat$totlen <- NULL
+avdat$len <- NULL
+
+#slim it down a bit to remove a lot of SC we don't need
+slimdat <- avdat[c(1:18,581:584,603:dim(avdat)[2])]
+slimdat$maize.acres <- avdat$X2016..Long.Rain_Large.Maize.acres + avdat$X2016..Long.Rain_Small.Maize.acres
+slimdat <- Filter(function(x)!all(is.na(x)), slimdat)
+slimdat$first_last_rep <- slimdat$LastRepayment -  slimdat$FirstRepayment
+
+slimdat[c("OAFID","SeasonID","RegionID","DistrictID","SectorID","SiteID","GroupID","nom")] <- NULL
+
+
+#make default flag
+slimdat$default <- slimdat$X..Repaid
+X..Repaid_ <-  slimdat$X..Repaid # keep seperate for future use
+slimdat$default[slimdat$default < 100] <- 0
+slimdat$default[slimdat$default == 100] <- 1
+slimdat$default <- as.factor(slimdat$default)
+
+#remove more useless cols
+
+slimdat[c("TotalRepaid","TotalRepaid_IncludingOverpayments","RemainingCredit","pc.new","first.maize.plant","last.maize.plant")] <- NULL
+
+
+
+
+drop_rate_ <- slimdat$drop_rate #also keep for later
+slimdat$drop_rate <- NULL
+
+
+#matrices for LASSO
+lassdat <- slimdat
+
+#make dates into numbers
+x <- grep("Date", lapply(lassdat,class) )
+lassdat[x] <- as.numeric(unlist(lassdat[x]))
+
+lassdat[c("X..Repaid","location.longitude_2016","location.latitude_2016","rep.rate","NewMember","location.fieldId_2016","date_ag2016","qualify.pc")] <- NULL
+
+lassdat$meantemp <- (lassdat$temperatures.max_2016 + lassdat$temperatures.max_2016)/2
+
+lassdat$first_last_rep <- as.numeric(lassdat$first_last_rep)
+
+#overwrite with cleaner data
+slimdat <- lassdat
+
+#drop for now
+lassdat$site_growth <- NULL # this is the % change in enrollment 2016 - 2017
+
+
+# # 
+# 
+# head(lassdat,n=10)
+
+
+```
+
+```{r, first-lasso, warning=FALSE}
+
+
+#run ONLY weather data to get predictors -------
+#temp df
+lassnull <- lassdat
+
+#engineered features
+lassnull$diff.pet <- lassnull$precipitation.amount_2016 / lassnull$pet.average 
+lassnull$precipitation.amount_2016 <- NULL
+lassnull$pet.average <- NULL
+
+lassnull$ppet_diff <- lassnull$ppet_ag2016 / lassnull$ppet.average
+lassnull$ppet_ag2016 <- NULL
+lassnull$ppet.average <- NULL
+
+lassnull$gdd_diff <- lassnull$gdd_ag2016 / lassnull$gdd.average
+lassnull$gdd.average <- NULL
+lassnull$gdd_ag2016 <- NULL
+
+lassnull$acc_gdd_diff <- lassnull$accumulatedGdd_ag2016 / lassnull$accumulatedGdd.average
+lassnull$accumulatedGdd_ag2016 <- NULL
+lassnull$accumulatedGdd.average <- NULL
+
+lassnull$acc_ppet_diff <- lassnull$accumulatedPpet_ag2016 / lassnull$accumulatedPpet.average
+lassnull$accumulatedPpet.average <- NULL
+lassnull$accumulatedPpet_ag2016 <- NULL
+
+lassnull$acc_pet_diff <- lassnull$accumulatedPet.amount_ag2016 / lassnull$accumulatedPet.average
+lassnull$accumulatedPet.amount_ag2016 <- NULL
+lassnull$accumulatedPet.average <- NULL
+
+lassnull$first_last_rep <- NULL
+
+
+lassnull[1:9] <- NULL
+lassnull[c(19)] <- NULL
+
+
+#remove features which are doubled up, leaving just features relating differences from 2016 to historic
+lassnull$gdd.stdDev <- NULL
+lassnull$pet.stdDev  <- NULL
+lassnull$ppet.stdDev  <- NULL
+lassnull$accumulatedGdd.stdDev  <- NULL
+lassnull$accumulatedPet.stdDev  <- NULL
+lassnull$accumulatedPpet.stdDev  <- NULL
+lassnull$accumulatedPrecipitation.stdDev  <- NULL
+lassnull$accumulatedPrecipitation.average  <- NULL
+lassnull$solar.amount_2016  <- NULL
+lassnull$wind.dayMax_2016  <- NULL
+lassnull$wind.morningMax_2016  <- NULL
+lassnull$relativeHumidity.max_2016  <- NULL
+lassnull$relativeHumidity.min_2016  <- NULL
+lassnull$wind.average_2016 <- NULL
+lassnull$temperatures.max_2016 <- NULL
+lassnull$temperatures.min_2016 <- NULL
+lassnull$accumulatedPrecipitation.amount_ag2016 <- NULL
+lassnull$pet.amount_ag2016 <- NULL
+
+#save for later use
+lassdiff <- lassnull
+
+#split data
+sample = sample.split(lassnull, SplitRatio = 0.75) #sample contains only boolean indecies
+tr = subset(lassnull, sample == TRUE)
+ho = subset(lassnull, sample == FALSE)
+tr_y <- tr$default
+ho_y <- ho$default
+
+x<- c("semi.name","default")
+tr[x] <- NULL
+ho[x] <- NULL
+
+
+#corrplot(cor(tr) ,tl.cex=0.8, tl.col='blue', tl.pos='lower'  ) 
+
+#lastly - convert to matrix
+tr <- as.matrix(tr)
+tr_y <- as.matrix(tr_y)
+ho <- as.matrix(ho)
+ho_y <- as.matrix(ho_y)
+
+
+```
+
+Let us now run the regression:
+
+```{r, lasso-2, warning=FALSE}
+
+
+
+#lambda range to optimise
+lam <- 10^seq(10,-10,length=200) ##get lambda sequence
+
+
+#tune alpha
+als <- c(0.0,0.1,0.25,0.5,0.75,0.9,1.0)
+xc <- get_alpha(tr,tr_y, als, type="Classifier")
+got_al <- xc$Alphas[which(xc$AUC == max(xc$AUC))]
+
+#this will tune lamba based on given lambda range
+cvnull <- cv.glmnet(x = scale(data.matrix(tr), center = TRUE, scale = TRUE), y = tr_y, family = 'binomial', lambda = lam, alpha=got_al,  type.measure = 'auc',intercept=TRUE)
+
+#save for later for PDPs
+cvpd1 <- glmnet(x = scale(data.matrix(tr), center = TRUE, scale = TRUE), y = tr_y, family = 'binomial', lambda = cvnull$lambda.1se, alpha=got_al, intercept=TRUE)
+tra <- tr
+trya <- tr_y
+
+
+
+#use bootstrap for  elastic net coeffs and SEMs
+dr <- c("semi.name","default") # variables to drop
+lst <- boot_net(dr,"default",lassdiff,type="classification",cvnull) # vars to drop, response var, df, type, and original elastic net
+
+
+lc <- lst$coeffs # coeffs with SEMs from bootstrap
+aucy <- mean(lst$score) #mean AUC score from bootstrap
+
+#row.names(lc) <- seq(1:dim(lc)[1])
+
+#could plot importance of vars
+#ggplot(data=lc, aes(reorder(feature, -Coeff), y=Coeff)) + geom_bar(stat = "identity") + theme(text = element_text(size=20),axis.text.x = element_text(angle=90, hjust=1)) + ylab("scaled coeff") + geom_errorbar(aes(reorder(feature, -Coeff), y=Coeff, ymin=Coeff-sem,ymax=Coeff+sem),width=0.25) + xlab("Feature")
+
+aucy_null <- aucy
+
+lc[2:3] <- exp(lc[2:3]) # take exponent
+lc[2:3] <- round(lc[2:3],2) # round
+lc_null <- lc # store
+
+#log odds
+
+#this might seem an odd way, but it is safer than hard coding positions in the table
+levels(lc$feature) <- gsub("diff.pet","Difference in Pet (Stdevs)", levels(lc$feature))
+lc_null <- lc
+
+kable(lc_null) # display cleanly
+
+
+
+
+
+```
+
+
+
+We will be using a fit measure called area under the curve (AUC, see glossary) and measuring whether we accurately predict site default (<100%) or repayment (=100%) on unseen data. 
+
+Using just the aWhere features at a site level, we achieve an AUC score of `r round(aucy_null,3)`. Which is a respectable, if not amazing, score. The table above contains only statistically significant coefficients. The coefficients indicate that an increase in PET of 1 standard deviation (= `r round(sd(lassdiff$diff.pet),2)` mm ) yields an odds ratio of `r lc_null$Coeff[2]`, so a `r (lc_null$Coeff[2] - 1)*100 ` % increase chance of full repayment. 
+
+## Caveating weather vs. repayment <a id="rep2"></a>
+
+**However**, what happens if we run a similar regression against historical data only (2005-2015)? Can we explain repayment by farmer climatic zones rather than yearly changes (spatially rather than temporally)?
+
+```{r, deeperweather, warning=FALSE}
+
+#temp df
+lassnull <- lassdat
+
+
+lassnull[1:9]<- NULL
+lassnull$first_last_rep <- NULL
+lassnull$maize.acres <- NULL
+lassnull[15:30] <- NULL
+
+
+
+#set.seed(2345)
+lassweather <- lassnull
+sample = sample.split(lassnull, SplitRatio = 0.75) #sample contains only boolean indecies
+tr = subset(lassnull, sample == TRUE)
+ho = subset(lassnull, sample == FALSE)
+tr_y <- tr$default
+ho_y <- ho$default
+
+x<- c("semi.name","default")
+tr[x] <- NULL
+ho[x] <- NULL
+
+
+
+#corrplot(cor(tr) ,tl.cex=0.8, tl.col='blue', tl.pos='lower'  ) 
+
+
+
+#lastly - convert to matrix
+tr <- as.matrix(tr)
+tr_y <- as.matrix(tr_y)
+ho <- as.matrix(ho)
+ho_y <- as.matrix(ho_y)
+
+
+
+#set lambda range to test
+lam <- 10^seq(10,-10,length=200) ##get lambda sequence
+
+#tune alpha
+als <- c(0.0,0.1,0.25,0.5,0.75,0.9,1.0)
+xc <- get_alpha(tr,tr_y, als, type="Classifier")
+got_al <- xc$Alphas[which(xc$AUC == max(xc$AUC))]
+
+cvdat <- cv.glmnet(x = scale(data.matrix(tr)), y = tr_y, family = 'binomial', lambda = lam, alpha=got_al,  type.measure = 'auc',intercept=TRUE)
+
+#save for later for PDPs
+cvpd2 <- glmnet(x = scale(data.matrix(tr), center = TRUE, scale = TRUE), y = tr_y, family = 'binomial', lambda = cvdat$lambda.1se, alpha=got_al,intercept=TRUE)
+trb <- tr
+tryb <- tr_y
+
+
+#get bootstrapped elastic net coeffs
+dr <- c("semi.name","default")
+lst <- boot_net(dr,"default",lassnull,type="classification",cvdat)
+
+
+lc <- lst$coeffs
+aucy <- mean(lst$score)
+
+
+
+
+
+#lc <- lc[-1,]
+lc <- lc[order(-lc[,2]),]
+
+#row.names(lc) <- seq(1:dim(lc)[1])
+#ggplot(data=lc, aes(reorder(feature, -Coeff), y=Coeff)) + geom_bar(stat = "identity") + theme(text = element_text(size=20),axis.text.x = element_text(angle=90, hjust=1)) + ylab("scaled coeff") + geom_errorbar(aes(reorder(feature, -Coeff), y=Coeff, ymin=Coeff-sem,ymax=Coeff+sem),width=0.25) + xlab("Feature")
+
+
+lc <- subset(lc, Coeff >= sem)
+
+lc[2:3] <- exp(lc[2:3])
+lc[2:3] <- round(lc[2:3],2)
+
+
+lc_geo <- lc
+
+kable(lc_geo)
+
+
+
+aucy_app1 <- aucy
+
+
+```
+
+
+The table above is derived from such an analysis. We can note that using historic averages only (no 2016 data) generates a similar AUC score of `r round(aucy_app1,3)` . This suggests that *2016 weather in itself had no impact on farmer repayment*. Instead, we can say that areas with historically good weather often outperform those with historically bad weather, and this same trend manifested in 2016. 
+
+ > **At this point**: We can conclude that 2016 weather patterns did not lead to meaningful changes in repayment behavior. These changes are inline with historical differences between sites.
+
+# Site growth vs. weather (H2)
+
+Let's now look at site growth in relation to weather. We are defining site growth as *total clients 2015/total clients 2016*, where anything above 100 indicates site growth, and anything below 100 represents site shrinkage. We will look at an alternative measure of enrollment (site drop rate) later. 
+
+
+We can first examine the raw data:
+
+```{r site1, warning=FALSE}
+
+lassdat$site_growth <- slimdat$site_growth #reintroduce into DF
+
+ggplot(lassdat) + geom_freqpoly(binwidth=8,aes(x=site_growth,colour="Site growth"),size=2)  + xlab("site growth (%)")
+
+
+```
+
+
+We can see that our distribution is centered around 100%, meaning the median (most common) site did not increase clients from 2015 to 2016, however there is a long tail of sites that grew significantly in this time. 
+
+
+```{r site2, warning=FALSE}
+
+
+#get df
+lassnull <- lassdiff
+lassnull$site_growth <- slimdat$site_growth
+
+
+sample = sample.split(lassnull, SplitRatio = 0.75) #sample contains only boolean indecies
+tr = subset(lassnull, sample == TRUE)
+ho = subset(lassnull, sample == FALSE)
+tr_y <- tr$site_growth
+ho_y <- ho$site_growth
+
+
+x<- c("semi.name","site_growth","default")
+tr[x] <- NULL
+ho[x] <- NULL
+
+#corrplot(cor(tr) ,tl.cex=0.5, tl.col='blue', tl.pos='lower'  ) 
+
+#lastly - convert to matrix
+tr <- as.matrix(tr)
+tr_y <- as.matrix(tr_y)
+ho <- as.matrix(ho)
+ho_y <- as.matrix(ho_y)
+
+
+
+als <- c(0.0,0.1,0.25,0.5,0.75,0.9,1.0)
+xc <- get_alpha(tr,tr_y, als, type="Regressor")
+got_al <- xc$Alphas[which(xc$AUC == min(xc$AUC))]
+
+
+
+cvenroll_simp <- cv.glmnet(x = scale(data.matrix(tr)), y = tr_y, family = 'gaussian', alpha=got_al,  type.measure = 'mse',nlambda=10000,intercept=TRUE)
+
+
+
+cven_simp <- glmnet(x = scale(data.matrix(tr)), y = tr_y, family = 'gaussian', alpha=got_al, lambda=cvenroll_simp$lambda.1se, intercept=TRUE)
+
+
+#get bootstrapped elastic net coeffs
+dr <- c("semi.name","default","site_growth")
+lst <- boot_net(dr,"site_growth",lassnull,type="regression",cvenroll_simp)
+
+
+lc <- lst$coeffs
+aucy <- mean(lst$score)
+
+lc <- lc[order(-lc[,2]),]
+lc[2:3] <- round(lc[2:3],2)
+
+#row.names(lc) <- seq(1:dim(lc)[1])
+
+#CV predictions
+prob <- predict(cvenroll_simp,type="response", newx = scale(data.matrix(ho)), s = 'lambda.1se')
+
+
+
+df <- data.frame("hold" = ho_y, "predicted" = prob)
+ggplot(df) + geom_point(aes(x=hold, y=X1)) + xlab("Observed values (from data)") + ylab("Model predicted values") + geom_smooth(aes(x=hold,y=X1),method = "lm", se = TRUE)   + ggtitle("Site level growth in enrollment - 2016 deviations")  + geom_text(aes(x=min(hold)*1.5,y=max(X1)), label=paste("Rsq:", round(mean(aucy) ,2 )))
+
+
+levels(lc$feature) <- gsub("acc_gdd_diff","Difference in acc. GDD (Stdevs)", levels(lc$feature))
+
+kable(lc)
+
+
+
+```
+
+Above we see a plot of predicted values and actual values for site growth (%) and a table of coefficients. The poor R-squared score suggests no relationship can be found between 2016 weather data and site growth. 
+
+
+```{r site3, warning=FALSE}
+
+
+#get df
+lassnull <- lassweather
+lassnull$site_growth <- slimdat$site_growth
+
+set.seed(123123)
+sample = sample.split(lassnull, SplitRatio = 0.75) #sample contains only boolean indecies
+tr = subset(lassnull, sample == TRUE)
+ho = subset(lassnull, sample == FALSE)
+tr_y <- tr$site_growth
+ho_y <- ho$site_growth
+
+
+x<- c("semi.name","site_growth","default")
+tr[x] <- NULL
+ho[x] <- NULL
+
+#corrplot(cor(tr) ,tl.cex=0.5, tl.col='blue', tl.pos='lower'  ) 
+
+#lastly - convert to matrix
+tr <- as.matrix(tr)
+tr_y <- as.matrix(tr_y)
+ho <- as.matrix(ho)
+ho_y <- as.matrix(ho_y)
+
+
+
+als <- c(0.0,0.1,0.25,0.5,0.75,0.9,1.0)
+xc <- get_alpha(tr,tr_y, als, type="Regressor")
+got_al <- xc$Alphas[which(xc$AUC == min(xc$AUC))]
+
+
+cvenroll_simp <- cv.glmnet(x = scale(data.matrix(tr)), y = tr_y, family = 'gaussian', alpha=got_al,  type.measure = 'mse',nlambda=10000,intercept=TRUE)
+
+#cven_simp <- glmnet(x = scale(data.matrix(tr)), y = tr_y, family = 'gaussian', alpha=got_al, lambda=cvenroll_simp$lambda.1se, intercept=TRUE)
+
+#get bootstrapped elastic net coeffs
+dr <- c("semi.name","default","site_growth")
+lst <- boot_net(dr,"site_growth",lassnull,type="regression",cvenroll_simp)
+
+
+lc <- lst$coeffs
+aucy <- mean(lst$score)
+
+
+lc <- lc[order(-lc[,2]),]
+lc[2:3] <- round(lc[2:3],2)
+#row.names(lc) <- seq(1:dim(lc)[1])
+
+prob <- predict(cvenroll_simp,type="response", newx = scale(data.matrix(ho)), s = 'lambda.1se')
+
+
+
+df <- data.frame("hold" = log(ho_y), "predicted" = prob)
+ggplot(df) + geom_point(aes(x=hold, y=X1)) + xlab("Observed values (from data)") + ylab("Model predicted values") + geom_smooth(aes(x=hold,y=X1),method = "lm", se = TRUE)   + ggtitle("Site level growth in enrollment - full weather data set")  + geom_text(aes(x=min(hold)*1.4,y=max(X1)), label=paste("Rsq:", round(mean(aucy) ,2 )))
+
+kable(lc)
+
+aucy1 <- aucy
+
+```
+
+
+However, looking at spatial differences in site growth vs. a fuller weather data set (as we did for repayment) yields a few significant factors. It should be noted that the R-squared for this model is only `r round(mean(aucy) ,2 )`, meaning we can only explain `r 100 * round(mean(aucy) ,2 )` % of the data with our model (terrible!). 
+
+If we examine the coefficients, we find that PPET has a positive relation to site growth, whilst PET standard deviation has a negative relationship. Suggesting that areas with higher moisture, and lower variation in moisture are more likely to enroll, although, to reiterate, the impact of these features is limited.
+
+
+## Alternative measures of enrollment
+
+As well as looking at the growth of sites from 2015-2016, we can also look at what percentage of farmers fail to qualify (data from Roster's [drop list](https://drive.google.com/open?id=0B3_WyX1D8qwMZ0Q3VXlsX3BkNkk) ). 
+
+```{r qual1, warning=FALSE}
+
+
+#get df
+lassnull <- lassweather
+lassnull$drop_rate <- drop_rate_
+
+lassnull <- subset(lassnull, drop_rate < 100)
+sample = sample.split(lassnull, SplitRatio = 0.75) #sample contains only boolean indecies
+tr = subset(lassnull, sample == TRUE)
+ho = subset(lassnull, sample == FALSE)
+tr_y <- tr$drop_rate
+ho_y <- ho$drop_rate
+
+
+x<- c("semi.name","drop_rate","default")
+tr[x] <- NULL
+ho[x] <- NULL
+
+#corrplot(cor(tr) ,tl.cex=0.5, tl.col='blue', tl.pos='lower'  ) 
+
+#lastly - convert to matrix
+tr <- as.matrix(tr)
+tr_y <- as.matrix(tr_y)
+ho <- as.matrix(ho)
+ho_y <- as.matrix(ho_y)
+
+
+
+als <- c(0.0,0.1,0.25,0.5,0.75,0.9,1.0)
+xc <- get_alpha(tr,tr_y, als, type="Regressor")
+got_al <- xc$Alphas[which(xc$AUC == min(xc$AUC))]
+
+
+cvdrop <- cv.glmnet(x = scale(data.matrix(tr)), y = tr_y, family = 'gaussian', alpha=got_al,  type.measure = 'mse',nlambda=100,intercept=TRUE)
+
+#get bootstrapped elastic net coeffs
+dr <- c("semi.name","default","drop_rate")
+lst <- boot_net(dr,"drop_rate",lassnull,type="regression",cvdrop)
+
+
+lc <- lst$coeffs
+aucy <- mean(lst$score)
+
+
+lc <- lc[order(-lc[,2]),]
+lc[2:3] <- round(lc[2:3],2)
+#row.names(lc) <- seq(1:dim(lc)[1])
+
+prob <- predict(cvdrop,type="response", newx = scale(data.matrix(ho)), s = 'lambda.1se')
+
+
+
+df <- data.frame("hold" = ho_y, "predicted" = prob)
+ggplot(df) + geom_point(aes(x=hold, y=X1)) + xlab("Observed values (from data)") + ylab("Model predicted values") + geom_smooth(aes(x=hold,y=X1),method = "lm", se = TRUE)   + ggtitle("Site level drop rate - full weather set")  + geom_text(aes(x=min(hold)*1.5,y=max(X1)), label=paste("Rsq:", round(mean(aucy) ,2 )))
+
+##kable(lc)
+
+
+
+
+
+```
+
+Using drop rate as our response metric, we see an improved (but still very poor) R-squared of  `r round(aucy,2)`. Again, suggesting weather data is not useful in predicting drop rate. 
+
+From these results, I would say there is very little relationship between site growth (assessed through the above metrics) and weather patterns. For any substantial relationship I would expect an R-squared of 0.5 or above, indicating that more than half of the data can be explained by the model. 
+
+# Time series analysis of weather data (H3)
+
+Finally, let us examine the relationship between site level default and time-series data. We can now divide our weather data into smaller time frames to see whether we are smoothing out any weather based effects with our time window above. 
+
+Note that the above analysis uses a 120 day period beginning with the mean maize planting data, the below analysis will look at every successive 2-week period to unpick time dependent effects. We will look at our overall AUC score in predicting default vs. time frame and check for trends. 
+
+
+```{r times1, warning=FALSE, results='hide',fig.keep='all'}
+
+#get dates every fortnight after planting
+times <- seq(1:26)
+times <- c(1,times * 7) + mu_plant
+
+df2 <- data.frame("semi.name"=slimdat$semi.name, "default"=slimdat$default)
+timeco1 <- invisible(get_timed_coeff(mu_plant,awhr, ag16 , awhr16, times, "default", df2 , al="NONE", type="diff"))
+
+timeco1$date <- times[1:(length(times)-1)]
+ggplot(timeco1) + geom_point(aes(x=date, y=AUC)) + geom_smooth(aes(x=date, y=AUC), method='rlm') + geom_errorbar(aes(date, y=AUC, ymin=AUC-SD,ymax=AUC+SD),width=0.25) + xlab("Date") + ylab("Mean AUC score")
+
+```
+
+The graph above shows the AUC score against time, despite the slight downward trend the data (which looks to be within 1 confidence interval of itself at all times), there is very little relationship. This is not unexpected given that we can predict farmer default from historic data alone. 
+
+```{r, times2, warning=FALSE, echo=FALSE}
+  # ls <- as.list(list.files(path="./regressions/", pattern="*net.csv", full.names=TRUE))
+  # 
+  # ls <- unlist(ls)
+  # 
+  # timedf <- data.frame("feature"=colnames(lassdat))
+  # timedf <- NULL
+  # colnames(lassdat)
+  # i <-1
+  # for(i in ls){
+  #   fi <- read.csv(i)
+  #   colnames(fi)[1] <- "feature"
+  #   timedf <- merge(timedf, fi[c("feature","value")], by="feature", all = TRUE)
+  # 
+  # }
+
+```
+
+
+# Methodology (technical - feel free to skip)  <a id="methodology"></a>
+
+## Data preperation
+A master data.frame was merged from multiple data sources. This includes, season's clients (Roster), vertical repayment (Roster), planting dates (provided by Chris Swanson), enrollment data (provided by Simon Beres), GPS data (provided by Jan Korevaar),  weather data from [aWhere](http://www.awhere.com "aWhere website"). All data is available [here]( https://drive.google.com/open?id=0B3_WyX1D8qwMQ0M2QVVDZGdvemc "Gdrive"), as well as merged data frames [here]( https://drive.google.com/open?id=0B3_WyX1D8qwMQ0M2QVVDZGdvemc "Gdrive"). 
+
+This script deals with analysis only, cleaning scripts are likewise available [here]( https://drive.google.com/open?id=0B3_WyX1D8qwMQ0M2QVVDZGdvemc "Gdrive"). 
+
+## Analysis approach
+The weather data is highly correlated, as mentioned above, this makes it difficult to identify minima in the solution landscape, which means that equally accurate models can be made from a variety of features, and that the feature coefficients are likely to be unstable. 
+
+To streamline the data and deal with multi-collinear features on a short time frame I have employed an elastic net algorithm (with tuning functions) with a bootstrap wrapper. This bootstrap-elastic net hybrid is doing 2 things:
+
+* Robust feature selection to identify the fewest possible climate factors influencing our response variable. Features repeatedly identified are grouped and subjected to confidence interval checks. This function is called *boot_net* in the setup Rmd chunk. 
+
+* Coefficient error estimation, as an elastic net is a biased regressor we cannot obtain coefficient errors through simple means. The bootstrap approach will yield an estimate of how robust coefficients are to different training data and different minimization paths. 
+
+Feature selection is important for, and complicated by, multi-collinear features (i.e. explanatory variables exhibit high correlation, see appendix for example). Ideally we want to identify the best feature, out of a group of correlated features, for response prediction. The elastic net allows the simultaneous evaluation of coefficients, whilst biasing the net toward L1 regression will also allow feature extraction. We are therefore aiming for a sparse solution to the question "what features predict Y". 
+
+This method will produce two key diagnostic outcomes, a cross-validation score for farmer default (i.e. how accurate is our model on new data) and a coefficient. Despite the steps taken above, coefficients should still be taken with a pinch of salt. 
+
+
+
+
+# Appendix
+
+
+
+## Glossary  <a id="glossary"></a>
+
+* GDD - Growing Degree Days— number of heat units achieved per day.
+
+* PET - Potential Evapotranspiration for each day, calculated using the Penman-Monteith Equation.
+
+* PPET -  Precipitation-over-PET (P/PET), a ratio that can indicate potential crop stress from over-dryness (values under 1), or over-saturation (values over 1). P/PET is calculated using the accumulated Precipitation over the Accumulated PET.
+
+* Accumulated PET (etc.) - A cumulative sum of PET
+
+* R-squared (R2) : a measure of how accurately a model captures explanatory factors. R squared spans from 0 (zero explanatory power) to 1 (complete explanatory power)
+
+* AUC: Area under the curve score:  a measure of classification accuracy, where 0.5 represents a random guess, and 1.0 represents perfect prediction. Respectable scores are generally 0.65-0.85, anything above 0.85 is fantastic. 
+
+## A note on previous analyses
+
+Similar relationships were explored by [Jane Yang](jane.yang@oneacrefund.org "Jane's email") and Robert On (see [here](https://oneacrefund.igloocommunities.com/projects/projects/kenya_repayment_analyses_2016)). 
+
+Jane's analysis used harvest data from M&E in place of weather data (assuming that drought would have impacted harvest to then impact repayment), and found no strong relationship between harvest and repayment (in line with my findings here). 
+
+Robert's earlier analysis (carried out in June 2016), *did* find a robust relationship, however there are a few caveats to his analysis:
+
+* Robert's analysis looked at repayment in June, ours looks at final repayment.
+
+* June 2016 was only 2 months after the mean maize planting date of farmers (April 1 2016), this does not seem enough time for any drought type effects to kick in given that maize typically grows for 2-7 months (see [here]("http://www.kenyaseed.com/index.php?option=com_content&view=article&id=222&Itemid=224")). 
+
+* Our analysis takes into account farmer planting dates to limit the timeframe of analysis
+
+* Our analysis probes time-dependent effects. 
+
+* Historical data alone (no 2016) was not examined in previous analyses, therefore our [first](#rep1) finding was examined, but not our [second](#rep2) (which heavily caveats the first). I believe he was essentially picking up regions with high standard deviations in rainfall (as our [second](#rep2) analysis does). A test for this would be to normalize historical data by both average and standard deviations and then re-examine findings. 
+
+* Robert's first findings still only explained 17% of variation in repayment, which is hardly a significant amount. 
+
+* Our results here are cross-validated on a holdout set, whilst this does not control for multi-collinearity, it does provide some additional robustness to our findings.
+
+> The above points lead me to think that this is a more thorough analysis superceding the previous analyses. One potential area to explore is the effect of 2016 drought on *2017* repayment, due to the greater delay in harvest and repayment. 
+
+
+## A note on predictive modelling
+
+To give an idea of how accurate a weather based model would be for repayment predictions, we can compare three scenarios: 1) weather only data, 2) Roster only data and 3) a combination of both data. 
+
+
+```{r pred_example, warning=FALSE}
+
+
+#run without feature engineer
+sample = sample.split(lassdat, SplitRatio = 0.75) #sample contains only boolean indecies
+tr = subset(lassdat, sample == TRUE)
+ho = subset(lassdat, sample == FALSE)
+tr_y <- tr$default
+ho_y <- ho$default
+
+x<- c("semi.name","default")
+tr[x] <- NULL
+ho[x] <- NULL
+
+#lastly - convert to matrix
+tr <- as.matrix(tr)
+tr_y <- as.matrix(tr_y)
+ho <- as.matrix(ho)
+ho_y <- as.matrix(ho_y)
+
+#lasso reg to handle autocorr (see below for autocorr results)
+
+# Note alpha=1 for lasso only and can blend with ridge penalty down to
+# alpha=0 ridge only.
+
+tr_corr <- tr
+
+
+#get lambda
+
+als <- c(0.0,0.1,0.25,0.5,0.75,0.9,1.0)
+xc <- get_alpha(tr,tr_y, als, type="Classifier")
+got_al <- xc$Alphas[which(xc$AUC == min(xc$AUC))]
+
+
+cvlass <- cv.glmnet(x = scale(data.matrix(tr)), y = tr_y, family = 'binomial', alpha=got_al,  type.measure = 'auc',nlambda=100,intercept=TRUE)
+
+aucy_all <- max(cvlass$cvm)
+
+
+
+
+##and now only demo data
+
+lassnull <- lassdat
+
+lassnull[10:39] <- NULL
+lassnull$meantemp <- NULL
+lassnull$site_growth <- NULL
+
+
+sample = sample.split(lassnull, SplitRatio = 0.75) #sample contains only boolean indecies
+tr = subset(lassnull, sample == TRUE)
+ho = subset(lassnull, sample == FALSE)
+tr_y <- tr$default
+ho_y <- ho$default
+
+x<- c("semi.name","default")
+tr[x] <- NULL
+ho[x] <- NULL
+
+
+
+#lastly - convert to matrix
+tr <- as.matrix(tr)
+tr_y <- as.matrix(tr_y)
+ho <- as.matrix(ho)
+ho_y <- as.matrix(ho_y)
+
+als <- c(0.0,0.1,0.25,0.5,0.75,0.9,1.0)
+xc <- get_alpha(tr,tr_y, als, type="Classifier")
+got_al <- xc$Alphas[which(xc$AUC == min(xc$AUC))]
+
+cvnulltwo <- cv.glmnet(x = scale(data.matrix(tr)), y = tr_y, family = 'binomial', alpha=got_al,  type.measure = 'auc',nlambda=100,intercept=TRUE)
+
+aucy_roster <- max(cvnulltwo$cvm)
+
+```
+We will measure the AUC accuracy for predicting default, a higher AUC score is better:
+
+* Weather only data yields an AUC of `r round(aucy_null,3)`.
+* Roster only data yields an AUC of `r round(aucy_roster,3)`.
+* Combined data yields an AUC of `r round(aucy_all,3)`.
+
+So whilst weather does predict repayment, that same information is available in Roster (presumably as weather causes behavior changes throughout the season). The addition of weather nets us an increase of `r  round(aucy_all,3) - round(aucy_roster,3)  ` in AUC scoring. It therefore seems wiser to pursue a predictive model using only Roster data (as it is easier to access and clean).
+
+## Elastic net sample diagnostics:
+
+
+Elastic net scoring of aWhere only data:
+```{r app1}
+
+plot(cvnull)
+
+```
+
+
+Enrollment vs simple weather data diagnostics:
+```{r app2, warning=FALSE}
+plot(cvenroll_simp)
+
+```
+
+Partial dependency plots for 2016 weather (please note the points made in "takeaways"), a y-value of 1.0 indicates full repayment, a value of 0 indicates default. X values indicate standard deviations away from the mean (0).
+
+
+## Partial dependency plots
+
+Partial dependency plots for historical weather (please note the points made in "main takeaways"), a y-value of 1.0 indicates full repayment, a value of 0 indicates default. X values indicate standard deviations away from the mean (0).
+
+```{r plotmo1, warning=FALSE}
+
+
+tr <- tra 
+tr_y <- trya 
+plotmo(cvpd1, type = "response", pmethod = "partdep")
+
+
+```
+
+
+
+
+```{r plotmo2, warning=FALSE}
+
+tr <- trb
+tr_y <- tryb 
+plotmo(cvpd2, type = "response", pmethod = "partdep")
+
+
+
+```
+
+
+## Autocorrelation of variables
+
+
+Below we see a correlation plot for the most complex model including weather features, 2016 deviations and Roster data. Unsurprisingly there is a high level of correlation between factors, some of these relationships are explained below:
+
+```{r autocorr, warning=FALSE, results="hide" , fig.keep = "all"}
+
+corrplot(cor(tr_corr) ,tl.cex=0.5, tl.col='blue', tl.pos='lower'  ) 
+
+
+```
+
+* Mean temperature (meantemp) and growing degree days (GDD) are related by a simple agronomic equation, so it is unsurprising that these are correlated. 
+
+* Likewise, any feature will correlate with its accumulated (acc) value (as the latter is a cumulative sum of the former, e.g. acc_ppet is a running sum of ppet).
+
+* There are also natural correlations, such as mean temperature being lower during rainfall.
+
+* We are yet to understand the effect of GPS level correlation of weather and Roster data.
+
+
+
+
+
+
